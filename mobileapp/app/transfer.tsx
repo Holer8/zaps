@@ -39,7 +39,10 @@ import {
   saveLocalKeypair,
   submitPayment,
   getLocalKeypair,
+  buildPaymentEnvelope,
+  estimateTransactionFee,
   StellarWalletState,
+  type TransactionFeeEstimate,
 } from "../src/services/stellarWallet";
 import { getRecentRecipients, saveRecentRecipient } from "../src/services/api";
 import { isFederatedAddress } from "../src/utils/sep0007";
@@ -306,6 +309,8 @@ function TransferScreen() {
   const [walletState, setWalletState] = useState<StellarWalletState | null>(
     null
   );
+  const [transactionFeeEstimate, setTransactionFeeEstimate] =
+    useState<TransactionFeeEstimate | null>(null);
   const [connecting, setConnecting] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
@@ -338,8 +343,10 @@ function TransferScreen() {
   const [loadingContacts, setLoadingContacts] = useState(false);
   const [contactsLoaded, setContactsLoaded] = useState(false);
 
+  // #887 — Search recipients dynamically by Zaps ID
   const searchUsers = useCallback(async (query: string) => {
-    if (!query || query.length < 2) {
+    const cleanQuery = query.trim().replace(/^@/, "");
+    if (!cleanQuery || cleanQuery.length < 2) {
       setSearchResults([]);
       setShowDropdown(false);
       return;
@@ -347,7 +354,7 @@ function TransferScreen() {
     setSearching(true);
     try {
       const res = await fetch(
-        `${API_BASE}/api/users/search?q=${encodeURIComponent(query)}&limit=6`
+        `${API_BASE}/api/users/search?q=${encodeURIComponent(cleanQuery)}&limit=6`
       );
       if (!res.ok) throw new Error("Search failed");
       const data: ZapsUser[] = await res.json();
@@ -561,6 +568,42 @@ function TransferScreen() {
   const token = TOKENS.find((t) => t.id === selectedToken) || TOKENS[0];
 
   useEffect(() => {
+    if (step !== 3 || !walletState?.isConnected || !recipient || !amount) {
+      setTransactionFeeEstimate(null);
+      return;
+    }
+
+    let isMounted = true;
+
+    (async () => {
+      try {
+        const assetIssuer =
+          token.symbol !== "XLM" ? STELLAR_ASSET_ISSUERS[token.symbol] : undefined;
+        const txXdr = await buildPaymentEnvelope(
+          walletState.publicKey,
+          recipient,
+          amount,
+          token.symbol,
+          assetIssuer,
+          description || undefined
+        );
+        const estimate = await estimateTransactionFee(txXdr);
+        if (isMounted) {
+          setTransactionFeeEstimate(estimate);
+        }
+      } catch {
+        if (isMounted) {
+          setTransactionFeeEstimate(null);
+        }
+      }
+    })();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [step, walletState, recipient, amount, token.symbol, description]);
+
+  useEffect(() => {
     (async () => {
       const kp = await getLocalKeypair();
       if (kp) {
@@ -725,6 +768,13 @@ function TransferScreen() {
     setStep(3);
   };
 
+  const handleKeypadPress = (value: string) => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    setAmount((prev: string) =>
+      value === "backspace" ? prev.slice(0, -1) : prev + value
+    );
+  };
+
   const renderStep0 = () => (
     <View style={styles.stepContainer}>
       <Text style={styles.subtitle}>Choose how you want to send money.</Text>
@@ -825,17 +875,20 @@ function TransferScreen() {
               </Text>
             </View>
           )}
-          {/* Dropdown results */}
+          {/* Dropdown results (#887) */}
           {transferType === "ZAPS" &&
             showDropdown &&
             searchResults.length > 0 && (
-              <View style={styles.dropdownContainer}>
+              <View style={styles.dropdownContainer} testID="search-results-dropdown">
                 {searchResults.map((user) => (
                   <TouchableOpacity
                     key={user.address}
                     style={styles.dropdownItem}
                     onPress={() => handleSelectUser(user)}
                     activeOpacity={0.75}
+                    testID={`search-result-${user.username}`}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Select recipient ${user.username}`}
                   >
                     <View style={styles.dropdownAvatar}>
                       <Text style={styles.dropdownAvatarText}>
@@ -1014,7 +1067,7 @@ function TransferScreen() {
               <TouchableOpacity
                 key={num}
                 style={styles.keypadButton}
-                onPress={() => setAmount((prev: string) => prev + num)}
+                onPress={() => handleKeypadPress(num)}
               >
                 <Text style={styles.keypadButtonText}>{num}</Text>
               </TouchableOpacity>
@@ -1025,7 +1078,7 @@ function TransferScreen() {
               <TouchableOpacity
                 key={num}
                 style={styles.keypadButton}
-                onPress={() => setAmount((prev: string) => prev + num)}
+                onPress={() => handleKeypadPress(num)}
               >
                 <Text style={styles.keypadButtonText}>{num}</Text>
               </TouchableOpacity>
@@ -1036,7 +1089,7 @@ function TransferScreen() {
               <TouchableOpacity
                 key={num}
                 style={styles.keypadButton}
-                onPress={() => setAmount((prev: string) => prev + num)}
+                onPress={() => handleKeypadPress(num)}
               >
                 <Text style={styles.keypadButtonText}>{num}</Text>
               </TouchableOpacity>
@@ -1045,36 +1098,39 @@ function TransferScreen() {
           <View style={styles.keypadRow}>
             <TouchableOpacity
               style={styles.keypadButton}
-              onPress={() => setAmount((prev: string) => prev + ".")}
+              onPress={() => handleKeypadPress(".")}
             >
               <Text style={styles.keypadButtonText}>.</Text>
             </TouchableOpacity>
             <TouchableOpacity
               style={styles.keypadButton}
-              onPress={() => setAmount((prev: string) => prev + "0")}
+              onPress={() => handleKeypadPress("0")}
             >
               <Text style={styles.keypadButtonText}>0</Text>
             </TouchableOpacity>
             <TouchableOpacity
               style={styles.keypadButton}
-              onPress={() => setAmount((prev: string) => prev.slice(0, -1))}
+              onPress={() => handleKeypadPress("backspace")}
             >
               <Text style={styles.keypadButtonText}>⌫</Text>
             </TouchableOpacity>
           </View>
         </View>
 
+        {/* #888 — Note / Description input field */}
         <Input
           placeholder="What is this for? (e.g. Lunch 🍕)"
           value={description}
           onChangeText={setDescription}
           maxLength={100}
           style={styles.transferInput}
+          testID="transfer-note-input"
+          accessibilityLabel="Payment note"
         />
       </View>
 
-      {/* Visibility Selector */}
-      <View style={styles.visibilitySection}>
+      {/* #889 — Visibility Selector */}
+      <View style={styles.visibilitySection} testID="visibility-selector-section">
         <Text style={styles.sectionLabel}>Who can see this payment?</Text>
         <View style={styles.visibilityOptions}>
           <TouchableOpacity
@@ -1083,6 +1139,9 @@ function TransferScreen() {
               visibility === "PUBLIC" && styles.visibilityBtnActive,
             ]}
             onPress={() => setVisibility("PUBLIC")}
+            testID="visibility-public-button"
+            accessibilityRole="button"
+            accessibilityLabel="Public visibility"
           >
             <Ionicons
               name="globe-outline"
@@ -1105,6 +1164,9 @@ function TransferScreen() {
               visibility === "FRIENDS" && styles.visibilityBtnActive,
             ]}
             onPress={() => setVisibility("FRIENDS")}
+            testID="visibility-friends-button"
+            accessibilityRole="button"
+            accessibilityLabel="Friends visibility"
           >
             <Ionicons
               name="people-outline"
@@ -1127,6 +1189,9 @@ function TransferScreen() {
               visibility === "PRIVATE" && styles.visibilityBtnActive,
             ]}
             onPress={() => setVisibility("PRIVATE")}
+            testID="visibility-private-button"
+            accessibilityRole="button"
+            accessibilityLabel="Private visibility"
           >
             <Ionicons
               name="lock-closed-outline"
@@ -1189,23 +1254,37 @@ function TransferScreen() {
           </View>
         </View>
 
-        <View style={[styles.infoRow, { marginTop: 16 }]}>
+        <View style={[styles.infoRow, { marginTop: 16 }]} testID="summary-note-row">
           <View style={styles.recipientBadge}>
             <Ionicons name="chatbubble-outline" size={16} color="#777" />
           </View>
           <View style={styles.infoCol}>
             <Text style={styles.infoLabel}>Note</Text>
-            <Text style={styles.infoValue}>{description || "No note"}</Text>
+            <Text style={styles.infoValue} testID="summary-note-value">
+              {description || "No note"}
+            </Text>
           </View>
         </View>
 
-        <View style={[styles.infoRow, { marginTop: 16 }]}>
+        <View style={[styles.infoRow, { marginTop: 16 }]} testID="summary-privacy-row">
           <View style={styles.recipientBadge}>
-            <Ionicons name="eye-outline" size={16} color="#777" />
+            <Ionicons
+              name={
+                visibility === "PUBLIC"
+                  ? "globe-outline"
+                  : visibility === "FRIENDS"
+                  ? "people-outline"
+                  : "lock-closed-outline"
+              }
+              size={16}
+              color="#777"
+            />
           </View>
           <View style={styles.infoCol}>
             <Text style={styles.infoLabel}>Privacy</Text>
-            <Text style={styles.infoValue}>{visibility}</Text>
+            <Text style={styles.infoValue} testID="summary-privacy-value">
+              {visibility}
+            </Text>
           </View>
         </View>
       </View>
@@ -1231,6 +1310,8 @@ function TransferScreen() {
           amount={amount}
           tokenSymbol={token.symbol}
           description={description}
+          visibility={visibility}
+          feeEstimate={transactionFeeEstimate}
         />
 
         <View style={styles.confirmationActions}>

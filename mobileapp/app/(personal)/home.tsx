@@ -39,8 +39,15 @@ import {
   likePayment,
   unlikePayment,
   fetchFeed,
+  addComment,
 } from "../../src/services/socialService";
 import { fetchYieldBalance, updateAutoEarn } from "../../src/services/api";
+import {
+  BalanceCurrency,
+  formatBalance,
+  formatFiatBalance,
+  fiatFromTokens,
+} from "../../src/utils/balanceDisplay";
 import {
   markNotificationPromptDismissed,
   registerForPushNotificationsAsync,
@@ -138,8 +145,10 @@ export default function HomeScreen() {
   const router = useRouter();
   const [activeTab, setActiveTab] = useState<"public" | "friends">("public");
   const [feed, setFeed] = useState<FeedItem[]>(INITIAL_FEED);
-  const [availableBalance, setAvailableBalance] = useState("₦0.00");
-  const [totalYieldEarned, setTotalYieldEarned] = useState("₦0.00");
+  const [availableBalanceXlm, setAvailableBalanceXlm] = useState(0);
+  const [totalYieldEarnedXlm, setTotalYieldEarnedXlm] = useState(0);
+  const [displayCurrency, setDisplayCurrency] =
+    useState<BalanceCurrency>("NGN");
   const [yieldData, setYieldData] = useState<YieldSnapshot | null>(null);
   const [yieldStatus, setYieldStatus] = useState<
     "loading" | "success" | "error"
@@ -158,6 +167,8 @@ export default function HomeScreen() {
   const [refreshing, setRefreshing] = useState(false);
   const [notifPromptVisible, setNotifPromptVisible] = useState(false);
   const [notifRequesting, setNotifRequesting] = useState(false);
+  const [balanceMasked, setBalanceMasked] = useState(true);
+  const MASKED_BALANCE = "••••••";
   const earningsSheetTranslateY = useRef(new Animated.Value(48)).current;
   const earningsBackdropOpacity = useRef(new Animated.Value(0)).current;
   const shimmerAnim = useRef(new Animated.Value(-1)).current;
@@ -182,33 +193,32 @@ export default function HomeScreen() {
   const [commentsList, setCommentsList] = useState<Comment[]>([]);
 
   const FEED_CACHE_KEY = "feed_items_cache";
+  const HOME_CURRENCY_PREF_KEY = "home_display_currency";
   const YIELD_REQUEST_TIMEOUT_MS = 4500;
 
   const fetchYieldSnapshot = async (): Promise<YieldSnapshot> => {
     const data = await fetchYieldBalance();
     setAutoYieldEnabled(data.autoEarnEnabled);
-    
-    const formatCurr = (val: number) =>
-      `₦${val.toLocaleString("en-NG", {
-        minimumFractionDigits: 2,
-        maximumFractionDigits: 2,
-      })}`;
 
-    // Parse numbers formatting correctly
-    const parseAPIValue = (val: string | number) => {
-      if (typeof val === "number") return formatCurr(val);
-      const strVal = String(val);
-      if (strVal.includes("₦")) return strVal;
-      const parsed = Number(strVal);
-      return isNaN(parsed) ? strVal : formatCurr(parsed);
+    // Balances are XLM token amounts; NGN is derived by multiplying by the
+    // configured rate, so keep the raw token figure around to redraw the card
+    // in either denomination when the toggle flips.
+    const parseRawBalance = (val: string | number): number => {
+      if (typeof val === "number") return val;
+      const sanitized = String(val).replace(/[^\d.-]/g, "");
+      const parsed = Number(sanitized);
+      return Number.isFinite(parsed) ? parsed : 0;
     };
 
-    const formattedYield = parseAPIValue(data.totalYieldEarned);
-    const formattedAvailable = parseAPIValue(data.availableBalance);
-    
-    setAvailableBalance(formattedAvailable);
-    setTotalYieldEarned(formattedYield);
-    
+    const availableXlm = parseRawBalance(data.availableBalance);
+    const yieldXlm = parseRawBalance(data.totalYieldEarned);
+
+    setAvailableBalanceXlm(availableXlm);
+    setTotalYieldEarnedXlm(yieldXlm);
+
+    // Yield analytics (monthly chart, compounding projection) stay in Naira.
+    const formattedYield = formatFiatBalance(fiatFromTokens(yieldXlm));
+
     return {
       apy: typeof data.apy === "number" ? `${data.apy}%` : String(data.apy).includes("%") ? String(data.apy) : `${data.apy}%`,
       totalYieldEarned: formattedYield,
@@ -250,6 +260,41 @@ export default function HomeScreen() {
       setYieldError(message);
       setYieldStatus("error");
     }
+  }, []);
+
+  // Balance figures derived from the raw XLM tokens, redrawn in the active
+  // denomination the moment the currency preference changes.
+  const availableBalanceDisplay = useMemo(
+    () => formatBalance(availableBalanceXlm, displayCurrency),
+    [availableBalanceXlm, displayCurrency]
+  );
+  const totalYieldEarnedDisplay = useMemo(
+    () => formatBalance(totalYieldEarnedXlm, displayCurrency),
+    [totalYieldEarnedXlm, displayCurrency]
+  );
+
+  const toggleCurrency = useCallback(() => {
+    void Haptics.selectionAsync().catch(() => undefined);
+    setDisplayCurrency((prev) => {
+      const next = prev === "NGN" ? "XLM" : "NGN";
+      AsyncStorage.setItem(HOME_CURRENCY_PREF_KEY, next).catch(() => undefined);
+      return next;
+    });
+  }, []);
+
+  // Restore the user's saved display currency preference across app restarts.
+  useEffect(() => {
+    let cancelled = false;
+    AsyncStorage.getItem(HOME_CURRENCY_PREF_KEY)
+      .then((stored) => {
+        if (!cancelled && (stored === "NGN" || stored === "XLM")) {
+          setDisplayCurrency(stored);
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // On mount: hydrate UI from cache instantly, then fetch fresh data and overwrite cache
@@ -474,43 +519,65 @@ export default function HomeScreen() {
       () => undefined
     );
     setSelectedItem(item);
-    setCommentsList([
-      {
-        id: "c1",
-        user: "Tolu",
-        text: "Thanks for the food! 😋",
-        time: "1h ago",
-      },
-      {
-        id: "c2",
-        user: "Ebube",
-        text: "Anytime! Let's do it again.",
-        time: "45m ago",
-      },
-    ]);
+    setCommentText("");
+    // Seed with an empty list; new comments are appended after a successful
+    // POST /api/social/comment so the drawer always reflects backend state.
+    setCommentsList([]);
     setCommentsModalVisible(true);
   };
 
-  const submitComment = () => {
-    if (!commentText.trim() || !selectedItem) return;
-    const newComment = {
-      id: Date.now().toString(),
+  const submitComment = async () => {
+    const trimmed = commentText.trim();
+    if (!trimmed || !selectedItem) return;
+
+    void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(
+      () => undefined
+    );
+
+    const paymentId = selectedItem.id;
+    const optimistic: Comment = {
+      id: `local-${Date.now()}`,
       user: "Me",
-      text: commentText,
+      text: trimmed,
       time: "Just now",
     };
-    setCommentsList([...commentsList, newComment]);
-    setCommentText("");
 
-    // Update comments count on item
-    setFeed(
-      feed.map((item) => {
-        if (item.id === selectedItem.id) {
-          return { ...item, comments: item.comments + 1 };
-        }
-        return item;
-      })
+    // Optimistic UI: show the comment + bump the count immediately.
+    setCommentsList((prev) => [...prev, optimistic]);
+    setCommentText("");
+    setFeed((prev) =>
+      prev.map((item) =>
+        item.id === paymentId
+          ? { ...item, comments: item.comments + 1 }
+          : item
+      )
     );
+
+    try {
+      const saved = await addComment(paymentId, trimmed);
+      setCommentsList((prev) =>
+        prev.map((c) =>
+          c.id === optimistic.id
+            ? {
+                id: saved.id,
+                user: saved.username || "Me",
+                text: saved.content,
+                time: "Just now",
+              }
+            : c
+        )
+      );
+    } catch {
+      // Revert optimistic comment + count on failure.
+      setCommentsList((prev) => prev.filter((c) => c.id !== optimistic.id));
+      setFeed((prev) =>
+        prev.map((item) =>
+          item.id === paymentId
+            ? { ...item, comments: Math.max(0, item.comments - 1) }
+            : item
+        )
+      );
+    }
   };
 
   const openEarningsModal = () => {
@@ -608,6 +675,14 @@ export default function HomeScreen() {
       minimumFractionDigits: 2,
       maximumFractionDigits: 2,
     })}`;
+
+  const toggleBalanceMask = () => {
+    void Haptics.selectionAsync().catch(() => undefined);
+    setBalanceMasked((prev) => !prev);
+  };
+
+  const displayBalance = (amount: string) =>
+    balanceMasked ? MASKED_BALANCE : amount;
 
   const monthlyEarnings = useMemo(() => {
     const baseTotal = MONTHLY_EARNINGS.reduce(
@@ -781,8 +856,26 @@ export default function HomeScreen() {
         <View style={styles.balanceCard}>
           {/* Available Balance Section */}
           <View style={styles.balanceSection}>
-            <Text style={styles.balanceLabel}>Available Balance</Text>
-            <Text style={styles.balanceAmount}>{availableBalance}</Text>
+            <View style={styles.balanceLabelRow}>
+              <Text style={styles.balanceLabel}>Available Balance</Text>
+              <TouchableOpacity
+                onPress={toggleBalanceMask}
+                hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                accessibilityRole="button"
+                accessibilityLabel={
+                  balanceMasked ? "Show balance" : "Hide balance"
+                }
+              >
+                <Ionicons
+                  name={balanceMasked ? "eye-outline" : "eye-off-outline"}
+                  size={20}
+                  color="#777"
+                />
+              </TouchableOpacity>
+            </View>
+            <Text style={styles.balanceAmount}>
+              {displayBalance(availableBalance)}
+            </Text>
           </View>
 
           {/* Earning Balance Section */}
@@ -791,12 +884,19 @@ export default function HomeScreen() {
               <View style={styles.earningDot} />
               <Text style={styles.earningRowLabel}>Earning Balance</Text>
             </View>
-            <Text style={styles.earningBalanceAmount}>{totalYieldEarned}</Text>
+            <Text style={styles.earningBalanceAmount}>
+              {displayBalance(totalYieldEarned)}
+            </Text>
           </View>
 
+          {/* Pay / Request trigger button (#886) */}
           <TouchableOpacity
             style={styles.payRequestButton}
             onPress={() => router.push("/transfer")}
+            accessibilityRole="button"
+            accessibilityLabel="Pay / Request"
+            testID="pay-request-button"
+            activeOpacity={0.8}
           >
             <Ionicons
               name="send"
@@ -864,7 +964,9 @@ export default function HomeScreen() {
           >
             <View>
               <Text style={styles.earningLabel}>Earning Balance</Text>
-              <Text style={styles.earningAmount}>{totalYieldEarned}</Text>
+              <Text style={styles.earningAmount}>
+                {totalYieldEarnedDisplay}
+              </Text>
               <View style={styles.earningStatusRow}>
                 <Animated.View
                   style={[
@@ -904,7 +1006,7 @@ export default function HomeScreen() {
               <View style={styles.earningContent}>
                 <Text style={styles.earningLabel}>Earning Balance</Text>
                 <Text style={styles.earningAmount}>
-                  {yieldData?.totalYieldEarned ?? "₦0.00"}
+                  {totalYieldEarnedDisplay}
                 </Text>
                 <Text style={styles.earningHint}>
                   Tap to view yield breakdown
@@ -968,15 +1070,22 @@ export default function HomeScreen() {
         {/* Social Feed Section */}
         <View style={styles.feedContainer}>
           <Text style={styles.feedSectionTitle}>Activity</Text>
-          {/* Feed Tabs — Segment Control */}
+          {/* Feed Tabs — Public / Friends (#882) */}
           <View style={styles.tabBar}>
             <TouchableOpacity
               style={[
                 styles.tabItem,
                 activeTab === "public" && styles.tabItemActive,
               ]}
-              onPress={() => setActiveTab("public")}
+              onPress={() => {
+                void Haptics.selectionAsync().catch(() => undefined);
+                setActiveTab("public");
+              }}
               activeOpacity={0.85}
+              accessibilityRole="tab"
+              accessibilityState={{ selected: activeTab === "public" }}
+              accessibilityLabel="Public Feed"
+              testID="feed-tab-public"
             >
               <Text
                 style={[
@@ -992,8 +1101,15 @@ export default function HomeScreen() {
                 styles.tabItem,
                 activeTab === "friends" && styles.tabItemActive,
               ]}
-              onPress={() => setActiveTab("friends")}
+              onPress={() => {
+                void Haptics.selectionAsync().catch(() => undefined);
+                setActiveTab("friends");
+              }}
               activeOpacity={0.85}
+              accessibilityRole="tab"
+              accessibilityState={{ selected: activeTab === "friends" }}
+              accessibilityLabel="Friends Feed"
+              testID="feed-tab-friends"
             >
               <Text
                 style={[
@@ -1020,16 +1136,25 @@ export default function HomeScreen() {
                 </View>
 
                 <View style={styles.paymentInfo}>
-                  <View style={styles.paymentRow}>
-                    <Text style={styles.paymentText} numberOfLines={2}>
-                      <Text style={styles.boldText}>{item.sender}</Text> paid{" "}
-                      <Text style={styles.boldText}>{item.receiver}</Text>
+                  <View style={styles.partyRow}>
+                    <Text style={styles.partyLabel}>FROM</Text>
+                    <Text style={styles.partyName} numberOfLines={1}>
+                      {item.sender}
                     </Text>
-                    <View style={styles.amountPill}>
-                      <Text style={styles.amountText}>{item.amount}</Text>
-                    </View>
+                  </View>
+                  <View style={styles.partyRow}>
+                    <Text style={styles.partyLabel}>TO</Text>
+                    <Text style={styles.partyName} numberOfLines={1}>
+                      {item.receiver}
+                    </Text>
                   </View>
                   <Text style={styles.timestamp}>{item.timestamp}</Text>
+                </View>
+
+                <View style={styles.amountPill}>
+                  <Text style={styles.amountText} numberOfLines={1}>
+                    {item.amount}
+                  </Text>
                 </View>
               </View>
 
@@ -1044,6 +1169,11 @@ export default function HomeScreen() {
                 <TouchableOpacity
                   style={styles.actionItem}
                   onPress={() => handleLike(item.id)}
+                  accessibilityRole="button"
+                  accessibilityLabel={
+                    item.hasLiked ? "Unlike payment" : "Like payment"
+                  }
+                  testID={`feed-like-${item.id}`}
                 >
                   <Animated.View
                     style={{ transform: [{ scale: getScaleAnim(item.id) }] }}
@@ -1067,6 +1197,9 @@ export default function HomeScreen() {
                 <TouchableOpacity
                   style={styles.actionItem}
                   onPress={() => openComments(item)}
+                  accessibilityRole="button"
+                  accessibilityLabel="Open comments"
+                  testID={`feed-comments-${item.id}`}
                 >
                   <Ionicons name="chatbubble-outline" size={20} color="#666" />
                   <Text style={styles.actionCount}>{item.comments}</Text>
@@ -1172,7 +1305,7 @@ export default function HomeScreen() {
                     Total Yield Earned
                   </Text>
                   <Text style={styles.earningsMetricValue}>
-                    {yieldData?.totalYieldEarned ?? "₦0.00"}
+                    {totalYieldEarnedDisplay}
                   </Text>
                 </View>
 
@@ -1531,17 +1664,29 @@ export default function HomeScreen() {
         </View>
       </Modal>
 
-      {/* Comments Modal */}
+      {/* Comments bottom drawer (#885) — slide-up Modal */}
       <Modal
         visible={commentsModalVisible}
         animationType="slide"
         transparent={true}
+        onRequestClose={() => setCommentsModalVisible(false)}
       >
         <View style={styles.modalOverlay}>
+          <TouchableOpacity
+            style={StyleSheet.absoluteFill}
+            activeOpacity={1}
+            onPress={() => setCommentsModalVisible(false)}
+            accessibilityLabel="Dismiss comments"
+          />
           <View style={styles.modalContent}>
+            <View style={styles.commentsGrabber} />
             <View style={styles.modalHeader}>
               <Text style={styles.modalTitle}>Comments</Text>
-              <TouchableOpacity onPress={() => setCommentsModalVisible(false)}>
+              <TouchableOpacity
+                onPress={() => setCommentsModalVisible(false)}
+                accessibilityRole="button"
+                accessibilityLabel="Close comments"
+              >
                 <Ionicons name="close" size={24} color="#000" />
               </TouchableOpacity>
             </View>
@@ -1549,7 +1694,12 @@ export default function HomeScreen() {
             <FlatList<Comment>
               data={commentsList}
               keyExtractor={(item: Comment) => item.id}
-              contentContainerStyle={{ paddingVertical: 12 }}
+              contentContainerStyle={{ paddingVertical: 12, flexGrow: 1 }}
+              ListEmptyComponent={
+                <Text style={styles.commentsEmpty}>
+                  Be the first to comment
+                </Text>
+              }
               renderItem={({ item }: { item: Comment }) => (
                 <View style={styles.commentItem}>
                   <View style={styles.commentAvatar}>
@@ -1572,8 +1722,22 @@ export default function HomeScreen() {
                 placeholder="Write a comment..."
                 value={commentText}
                 onChangeText={setCommentText}
+                returnKeyType="send"
+                onSubmitEditing={() => {
+                  void submitComment();
+                }}
+                accessibilityLabel="Comment input"
+                testID="comment-input"
               />
-              <TouchableOpacity style={styles.sendBtn} onPress={submitComment}>
+              <TouchableOpacity
+                style={styles.sendBtn}
+                onPress={() => {
+                  void submitComment();
+                }}
+                accessibilityRole="button"
+                accessibilityLabel="Send comment"
+                testID="comment-send"
+              >
                 <Ionicons name="send" size={20} color={COLORS.primary} />
               </TouchableOpacity>
             </View>
@@ -1695,11 +1859,16 @@ const styles = StyleSheet.create({
   balanceSection: {
     marginBottom: 16,
   },
+  balanceLabelRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 4,
+  },
   balanceLabel: {
     fontSize: 13,
     fontFamily: "Outfit_400Regular",
     color: "#777",
-    marginBottom: 4,
   },
   balanceAmount: {
     fontSize: 34,
@@ -2331,8 +2500,9 @@ const styles = StyleSheet.create({
     borderRadius: 10,
   },
   tabItemActive: {
-    backgroundColor: "#0F3D2E",
-    shadowColor: "#0F3D2E",
+    // Dark green active state (#882)
+    backgroundColor: COLORS.primary,
+    shadowColor: COLORS.primary,
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.18,
     shadowRadius: 4,
@@ -2349,7 +2519,7 @@ const styles = StyleSheet.create({
   },
   feedCard: {
     backgroundColor: COLORS.white,
-    borderRadius: 24,
+    borderRadius: 20,
     padding: 16,
     marginBottom: 14,
     borderWidth: 1,
@@ -2362,7 +2532,7 @@ const styles = StyleSheet.create({
   },
   feedHeader: {
     flexDirection: "row",
-    alignItems: "flex-start",
+    alignItems: "center",
     marginBottom: 12,
   },
   avatarStack: {
@@ -2395,43 +2565,46 @@ const styles = StyleSheet.create({
   },
   paymentInfo: {
     flex: 1,
+    minWidth: 0,
+    gap: 3,
   },
-  paymentRow: {
+  partyRow: {
     flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "flex-start",
-    flexWrap: "wrap",
+    alignItems: "baseline",
+    gap: 6,
   },
-  paymentText: {
-    flex: 1,
-    fontSize: 15,
-    lineHeight: 20,
-    fontFamily: "Outfit_400Regular",
-    color: "#334155",
-    flexShrink: 1,
-    marginRight: 8,
-  },
-  boldText: {
+  partyLabel: {
+    width: 31,
+    fontSize: 9,
     fontFamily: "Outfit_700Bold",
-    color: "#111827",
+    color: "#94A3B8",
+  },
+  partyName: {
+    flex: 1,
+    minWidth: 0,
+    fontSize: 14,
+    lineHeight: 18,
+    fontFamily: "Outfit_700Bold",
+    color: "#17211D",
   },
   amountPill: {
     backgroundColor: "#F2F9F0",
     borderRadius: 999,
-    paddingHorizontal: 10,
+    paddingHorizontal: 9,
     paddingVertical: 6,
     borderWidth: 1,
     borderColor: "#DDF2DD",
-    alignSelf: "flex-start",
-    marginTop: 2,
+    alignSelf: "center",
+    marginLeft: 8,
+    maxWidth: 112,
   },
   amountText: {
-    fontSize: 13,
+    fontSize: 12,
     fontFamily: "Outfit_700Bold",
     color: "#2E7D32",
   },
   timestamp: {
-    fontSize: 12,
+    fontSize: 11,
     color: "#94A3B8",
     marginTop: 4,
   },
@@ -2441,7 +2614,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     paddingHorizontal: 12,
     paddingVertical: 10,
-    borderRadius: 16,
+    borderRadius: 12,
   },
   memoLabel: {
     fontSize: 11,
@@ -2488,8 +2661,23 @@ const styles = StyleSheet.create({
     borderTopRightRadius: 24,
     paddingHorizontal: 20,
     paddingBottom: 40,
-    paddingTop: 20,
+    paddingTop: 12,
     maxHeight: "75%",
+  },
+  commentsGrabber: {
+    alignSelf: "center",
+    width: 42,
+    height: 4,
+    borderRadius: 999,
+    backgroundColor: "#E2E8F0",
+    marginBottom: 10,
+  },
+  commentsEmpty: {
+    textAlign: "center",
+    color: "#94A3B8",
+    fontFamily: "Outfit_400Regular",
+    fontSize: 14,
+    paddingVertical: 28,
   },
   modalHeader: {
     flexDirection: "row",
